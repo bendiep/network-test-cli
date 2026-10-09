@@ -1,0 +1,609 @@
+#!/bin/zsh
+# Network Connection Tester for macOS. Source this file to test its functions.
+
+setopt extendedglob
+export LC_ALL=C
+
+configure_output() {
+  BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; RESET=""
+  if [[ -t 1 && $JSON_MODE == 0 && -z $OUTPUT_FILE && -z ${NO_COLOR+x} ]]; then
+    BOLD=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; GREEN=$'\e[32m'
+    YELLOW=$'\e[33m'; BLUE=$'\e[34m'; RESET=$'\e[0m'
+  fi
+}
+pass() { (( JSON_MODE )) || print -r -- "  ${GREEN}✔${RESET} $1"; return 0; }
+fail() { (( JSON_MODE )) || print -r -- "  ${RED}✘${RESET} $1"; return 0; }
+warn() { (( JSON_MODE )) || print -r -- "  ${YELLOW}!${RESET} $1"; return 0; }
+info() { (( JSON_MODE )) || print -r -- "    ${DIM}$1${RESET}"; return 0; }
+step() {
+  if (( ! JSON_MODE )); then
+    print
+    print -r -- "${BOLD}${BLUE}$1${RESET}"
+  fi
+  return 0
+}
+error() { print -ru2 -- "network-test: $1"; return 2; }
+
+# Bound the whole command, including DNS and child processes. macOS has no timeout.
+with_timeout() {
+  local seconds=$1; shift
+  perl -MPOSIX=setsid -e '
+    my $seconds = shift;
+    my $pid = fork();
+    defined $pid or die "fork: $!";
+    if (!$pid) {
+      setsid() >= 0 or die "setsid: $!";
+      exec @ARGV;
+      die "exec: $!";
+    }
+    my $stop = sub {
+      my ($code) = @_;
+      kill "KILL", -$pid;
+      kill "KILL", $pid;
+      waitpid $pid, 0;
+      exit $code;
+    };
+    $SIG{ALRM} = sub { $stop->(124) };
+    $SIG{INT} = sub { $stop->(130) };
+    $SIG{TERM} = sub { $stop->(143) };
+    alarm $seconds;
+    waitpid $pid, 0;
+    my $result = $?;
+    alarm 0;
+    exit(($result & 127) ? 128 + ($result & 127) : $result >> 8);
+  ' "$seconds" "$@"
+}
+
+help_text() {
+  cat <<'HELP'
+Usage: network-test [options] [address [port]]
+
+With no address, asks for an address and optional port in a terminal.
+Addresses can be hostnames, IPv4, IPv6, host:port, or full URLs.
+
+  --timeout SECONDS  Limit each check / TCP address attempt (default: 8)
+  --repeat COUNT     Run COUNT times (default: 1, maximum: 1000)
+  --interval SECONDS Pause between runs (default: 1, zero is allowed)
+  --quick            Skip ping; test the service immediately
+  --ipv4             Test only IPv4 addresses
+  --ipv6             Test only IPv6 addresses
+  --json             Print one JSON object per run, without progress text
+  --output FILE      Save the same output to a file as well as the terminal
+  -h, --help         Show this help
+  --                 End options
+
+Examples:
+  network-test api.example.com 443
+  network-test 'https://example.com:8443/health?ready=1'
+  network-test --ipv6 '[2001:db8::1]:443'
+  network-test --quick --repeat 3 --json --output results.jsonl example.com 443
+
+Exit codes: 0 success, 1 failed check, 2 invalid input/setup,
+            3 inconclusive (for example, blocked ping without a port).
+Web checks use GET, preserve the URL path/query, and do not follow redirects.
+All checks use direct connections, independent of HTTP proxy settings.
+HELP
+}
+
+# Normalize decimal input without evaluating untrusted shell arithmetic.
+parse_number() {
+  local value=$1 minimum=$2 maximum=$3
+  [[ $value == <-> ]] || return 1
+  value=${value##0#}; value=${value:-0}
+  (( ${#value} <= ${#maximum} )) || return 1
+  (( value >= minimum && value <= maximum )) || return 1
+  NUMBER=$value
+}
+
+ip_family() {
+  local candidate=${1%%%*}
+  if [[ $candidate == *:* ]]; then
+    perl -MSocket=inet_pton,AF_INET6 -e 'exit(defined inet_pton(AF_INET6, $ARGV[0]) ? 0 : 1)' "$candidate" 2>/dev/null || return 1
+    print 6
+  elif [[ $candidate == [0-9.]## ]]; then
+    perl -MSocket=inet_pton,AF_INET -e 'exit(defined inet_pton(AF_INET, $ARGV[0]) ? 0 : 1)' "$candidate" 2>/dev/null || return 1
+    print 4
+  else
+    return 1
+  fi
+}
+
+prepare_target() {
+  local raw=$1 port_arg=$2 authority suffix rest numeric_family label
+  raw=${raw##[[:space:]]#}; raw=${raw%%[[:space:]]#}
+  HOST=""; PORT=""; SCHEME=""; PORT_FROM_ADDR=""; URL_PATH="/"; WEB_URL=""; WEB_EXPECTED=0
+  [[ -n $raw && $raw != *[[:space:][:cntrl:]]* ]] || { error 'Enter an address without embedded whitespace or control characters.'; return 2; }
+  if [[ $raw == *://* ]]; then
+    SCHEME=${${raw%%://*}:l}
+    raw=${raw#*://}
+    case $SCHEME in
+      http|https|ssh|ftp|tcp) ;;
+      *) error "Unsupported protocol: $SCHEME"; return 2 ;;
+    esac
+  fi
+  authority=${raw%%[/?\#]*}
+  suffix=${raw#$authority}
+  suffix=${suffix%%\#*}
+  [[ -n $suffix ]] && URL_PATH=$suffix
+  [[ $URL_PATH == \?* ]] && URL_PATH="/$URL_PATH"
+  if [[ $authority == *@* ]]; then
+    if [[ $SCHEME == http || $SCHEME == https ]]; then
+      error 'HTTP URLs with embedded credentials are unsupported.'; return 2
+    fi
+    authority=${authority##*@}
+  fi
+  if [[ $authority == \[* ]]; then
+    [[ $authority == \[*\]* ]] || { error 'IPv6 brackets are incomplete.'; return 2; }
+    HOST=${authority#\[}; HOST=${HOST%%\]*}
+    rest=${authority#*\]}
+    [[ -z $rest || $rest == :<-> ]] || { error 'Expected a numeric port after the IPv6 brackets.'; return 2; }
+    [[ -n $rest ]] && PORT_FROM_ADDR=${rest#:}
+    [[ $HOST == *:* ]] || { error 'Brackets are only supported for IPv6 addresses.'; return 2; }
+  elif [[ $authority == *:*:* ]]; then
+    [[ -z $SCHEME ]] || { error 'Use brackets around IPv6 addresses in URLs.'; return 2; }
+    HOST=$authority
+  elif [[ $authority == *:* ]]; then
+    HOST=${authority%%:*}; PORT_FROM_ADDR=${authority#*:}
+    [[ -n $PORT_FROM_ADDR ]] || { error 'A port is required after the colon.'; return 2; }
+  else
+    HOST=$authority
+  fi
+  [[ -n $HOST ]] || { error 'Please enter a host.'; return 2; }
+  if [[ $HOST == *:* || $HOST == [0-9.]## ]]; then
+    # Decode a URL-encoded IPv6 scope separator before passing it to native tools.
+    [[ $HOST == *:* ]] && HOST=${HOST/\%25/\%}
+    numeric_family=$(ip_family "$HOST") || { error "Invalid IP address: $HOST"; return 2; }
+    if [[ $HOST == *%* && ${HOST#*%} != [A-Za-z0-9_.-]## ]]; then
+      error 'Invalid IPv6 scope identifier.'; return 2
+    fi
+    [[ $ADDRESS_FAMILY == auto || $ADDRESS_FAMILY == $numeric_family ]] || { error 'The IP address conflicts with the requested address family.'; return 2; }
+  else
+    [[ ${#HOST} -le 253 && $HOST == [A-Za-z0-9_][A-Za-z0-9_.-]# ]] || { error "Invalid hostname: $HOST"; return 2; }
+    for label in ${(s:.:)${HOST%.}}; do
+      [[ -n $label && ${#label} -le 63 && $label != -* && $label != *- ]] || { error "Invalid hostname: $HOST"; return 2; }
+    done
+    [[ $HOST != *..* ]] || { error "Invalid hostname: $HOST"; return 2; }
+  fi
+  # Validate an embedded port even when an explicit port overrides it.
+  if [[ -n $PORT_FROM_ADDR ]]; then
+    parse_number "$PORT_FROM_ADDR" 1 65535 || { error 'Ports must be numbers from 1 to 65535.'; return 2; }
+    PORT_FROM_ADDR=$NUMBER
+  else
+    case $SCHEME in
+      https) PORT_FROM_ADDR=443 ;; http) PORT_FROM_ADDR=80 ;;
+      ssh) PORT_FROM_ADDR=22 ;; ftp) PORT_FROM_ADDR=21 ;;
+    esac
+  fi
+  PORT=${port_arg:-$PORT_FROM_ADDR}
+  if [[ -n $PORT ]]; then
+    parse_number "$PORT" 1 65535 || { error 'Ports must be numbers from 1 to 65535.'; return 2; }
+    PORT=$NUMBER
+  fi
+  if [[ -z $SCHEME ]]; then
+    case $PORT in
+      443|8443) SCHEME=https ;;
+      80|8080|8000|3000|5000) SCHEME=http ;;
+    esac
+  fi
+  if [[ $SCHEME == http || $SCHEME == https ]]; then
+    WEB_EXPECTED=1
+    local url_host=${HOST/\%/\%25}
+    [[ $HOST == *:* ]] && url_host="[$url_host]"
+    WEB_URL="$SCHEME://$url_host:$PORT$URL_PATH"
+  fi
+  return 0
+}
+
+reset_result() {
+  TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  DNS_STATE=skipped; DNS_ERROR=""; DNS_IPS=(); TARGET_IP=""
+  ROUTE_STATE=skipped; ROUTE_INTERFACE=""; ROUTE_GATEWAY=""; LOCAL_IP=""; TUNNEL_ROUTE=0
+  PING_STATE=skipped; PING_LOSS=""; PING_AVG=""
+  TCP_STATE=skipped; TCP_ERROR=""; TCP_ATTEMPTS=()
+  WEB_STATE=skipped; WEB_ERROR=""; HTTP_CODE=""; REMOTE_IP=""; TLS_STATE=skipped
+  DNS_TIME=""; CONNECT_TIME=""; TLS_TIME=""; TTFB=""; TOTAL_TIME=""
+  RESULT=inconclusive; RESULT_CODE=3; SUMMARY=""
+}
+
+typeset -gaU DNS_IPS
+typeset -ga TCP_ATTEMPTS
+
+check_dns() {
+  step 'DNS lookup'
+  local family out rc ip
+  if family=$(ip_family "$HOST"); then
+    DNS_IPS=("$HOST")
+    DNS_STATE=passed
+    pass "$HOST is a numeric IPv$family address. No DNS lookup needed."
+  else
+    out=$(with_timeout "$TIMEOUT" dscacheutil -q host -a name "$HOST" 2>/dev/null)
+    rc=$?
+    if (( rc == 0 )); then
+      for ip in ${(f)"$(print -r -- "$out" | awk '/^ip(v6)?_address:/ {print $2}')"}; do
+        family=$(ip_family "$ip") || continue
+        [[ $ADDRESS_FAMILY == auto || $ADDRESS_FAMILY == $family ]] && DNS_IPS+=("$ip")
+      done
+    fi
+    if (( ${#DNS_IPS} )); then
+      DNS_STATE=passed
+      pass "Found $HOST: ${(j:, :)DNS_IPS}"
+    else
+      DNS_STATE=failed
+      if (( rc == 124 )); then
+        DNS_ERROR="DNS lookup timed out after $TIMEOUT seconds."
+      elif (( rc != 0 )); then
+        DNS_ERROR="The system DNS lookup failed with exit code $rc."
+      else
+        DNS_ERROR="No ${ADDRESS_FAMILY/auto/requested} IP addresses were found for $HOST."
+      fi
+      fail "$DNS_ERROR"
+      info 'Check the address and, for internal names, the required VPN or DNS settings.'
+    fi
+  fi
+  TARGET_IP=${DNS_IPS[1]}
+}
+
+check_port() {
+  step "TCP connection on port $PORT"
+  local ip out rc family reason
+  TCP_STATE=failed
+  for ip in "${DNS_IPS[@]}"; do
+    family=$(ip_family "$ip")
+    out=$(with_timeout "$TIMEOUT" nc "-$family" -z -v -G "$TIMEOUT" -w "$TIMEOUT" "$ip" "$PORT" 2>&1)
+    rc=$?
+    if (( rc == 0 )); then
+      TCP_ATTEMPTS+=("$ip|passed|Connected")
+      TCP_STATE=passed; TCP_ERROR=""; TARGET_IP=$ip
+      pass "Connected to $ip on port $PORT."
+      return
+    elif (( rc == 124 )) || [[ $out == *'timed out'* || $out == *'Operation now in progress'* ]]; then
+      reason="Timed out after $TIMEOUT seconds. The cause may be routing, a firewall, or an unavailable server."
+    elif [[ $out == *refused* ]]; then
+      reason='Connection refused. The service may be stopped, the port may be wrong, or a firewall may be rejecting it.'
+    else
+      reason="Connection failed with exit code $rc: ${out//$'\n'/ }"
+    fi
+    TCP_ATTEMPTS+=("$ip|failed|$reason")
+    TCP_ERROR=$reason
+    fail "$ip: $reason"
+  done
+}
+
+check_route() {
+  step "Route to $TARGET_IP"
+  local out family
+  family=$(ip_family "$TARGET_IP")
+  local route_family=-inet
+  [[ $family == 6 ]] && route_family=-inet6
+  out=$(with_timeout "$TIMEOUT" route -n get "$route_family" "$TARGET_IP" 2>/dev/null)
+  ROUTE_INTERFACE=$(print -r -- "$out" | awk '/^[[:space:]]*interface:/ {print $2; exit}')
+  ROUTE_GATEWAY=$(print -r -- "$out" | awk '/^[[:space:]]*gateway:/ {print $2; exit}')
+  if [[ -z $ROUTE_INTERFACE ]]; then
+    ROUTE_STATE=unknown
+    warn 'Could not inspect the target route. The connection checks still determine reachability.'
+    return
+  fi
+  ROUTE_STATE=found
+  info "Interface: $ROUTE_INTERFACE${ROUTE_GATEWAY:+, gateway: $ROUTE_GATEWAY}"
+  if [[ $family == 4 ]]; then
+    LOCAL_IP=$(with_timeout "$TIMEOUT" ipconfig getifaddr "$ROUTE_INTERFACE" 2>/dev/null)
+  else
+    LOCAL_IP=$(with_timeout "$TIMEOUT" ifconfig "$ROUTE_INTERFACE" 2>/dev/null | awk '/inet6 / {print $2; exit}')
+  fi
+  [[ -n $LOCAL_IP ]] && info "Interface address: $LOCAL_IP"
+  if [[ $ROUTE_INTERFACE == (utun|ppp|ipsec)<-> ]]; then
+    TUNNEL_ROUTE=1
+    info 'The target route uses a tunnel interface. This may be a VPN.'
+  else
+    info 'No tunnel interface detected on this route. This does not determine whether a VPN is connected.'
+  fi
+}
+
+check_ping() {
+  step "Ping $TARGET_IP"
+  local out family command=ping
+  family=$(ip_family "$TARGET_IP")
+  [[ $family == 6 ]] && command=ping6
+  out=$(with_timeout "$TIMEOUT" "$command" -c 3 "$TARGET_IP" 2>&1)
+  PING_LOSS=$(print -r -- "$out" | awk 'match($0, /[0-9.]+% packet loss/) {value=substr($0, RSTART, RLENGTH); sub(/% packet loss/, "", value); print value; exit}')
+  PING_AVG=$(print -r -- "$out" | awk -F/ '/round-trip|rtt/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $5); print $5; exit}')
+  if [[ $PING_LOSS =~ '^[0-9]+([.][0-9]+)?$' ]] && (( PING_LOSS < 100 )); then
+    PING_STATE=passed
+    pass "Ping answered, $PING_LOSS% packet loss${PING_AVG:+, average $PING_AVG ms}."
+  else
+    PING_STATE=unanswered
+    warn 'No ping response. Servers and firewalls may block ICMP; this does not prove the service is unavailable.'
+  fi
+}
+
+check_web() {
+  step "${(U)SCHEME} request"
+  info "GET $WEB_URL"
+  local res rc metrics verify_result resolve_ip=$TARGET_IP
+  local -a args
+  args=(-q -sS --globoff --noproxy '*' -o /dev/null --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT")
+  [[ $TARGET_IP == *:* ]] && resolve_ip="[$TARGET_IP]"
+  # Keep the hostname for TLS/SNI, but use the address whose TCP connection passed.
+  if ! ip_family "$HOST" >/dev/null; then
+    args+=(--resolve "$HOST:$PORT:$resolve_ip")
+  fi
+  [[ $ADDRESS_FAMILY == 4 ]] && args+=(-4)
+  [[ $ADDRESS_FAMILY == 6 ]] && args+=(-6)
+  args+=(-w '\n%{http_code}|%{remote_ip}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}|%{ssl_verify_result}')
+  res=$(with_timeout "$TIMEOUT" curl "${args[@]}" --url "$WEB_URL" 2>&1)
+  rc=$?
+  metrics=${res##*$'\n'}
+  WEB_ERROR=${res%$'\n'*}
+  if [[ $metrics =~ '^[0-9]{3}[|]' ]]; then
+    IFS='|' read -r HTTP_CODE REMOTE_IP DNS_TIME CONNECT_TIME TLS_TIME TTFB TOTAL_TIME verify_result <<< "$metrics"
+  fi
+  [[ $SCHEME == https ]] && TLS_STATE=unknown
+  if [[ $SCHEME == https && $verify_result == 0 && $TLS_TIME =~ '^[0-9]+([.][0-9]+)?$' ]] && (( TLS_TIME > 0 )); then
+    TLS_STATE=verified
+  fi
+  if (( rc != 0 )); then
+    WEB_STATE=failed
+    case $rc in
+      60|51) TLS_STATE=failed; WEB_ERROR="Certificate verification failed. $WEB_ERROR" ;;
+      35) TLS_STATE=failed; WEB_ERROR="TLS handshake failed. $WEB_ERROR" ;;
+      28|124) WEB_ERROR="Web request timed out or did not complete within $TIMEOUT seconds. $WEB_ERROR" ;;
+      *) WEB_ERROR="Web request failed with exit code $rc. $WEB_ERROR" ;;
+    esac
+    fail "$WEB_ERROR"
+    return
+  fi
+  if [[ $HTTP_CODE != [1-5][0-9][0-9] ]]; then
+    WEB_STATE=unknown; WEB_ERROR='The web check returned no valid HTTP status.'
+    warn "$WEB_ERROR"
+    return
+  fi
+  if [[ $SCHEME == https ]]; then
+    if [[ $verify_result == 0 ]]; then
+      TLS_STATE=verified
+      pass 'TLS completed and the certificate was verified.'
+    else
+      TLS_STATE=failed; WEB_STATE=failed; WEB_ERROR='TLS certificate verification did not succeed.'
+      fail "$WEB_ERROR"
+      return
+    fi
+  fi
+  WEB_ERROR=""
+  info "Connected IP: $REMOTE_IP"
+  info "Curl timings in seconds since request start: DNS $DNS_TIME, TCP $CONNECT_TIME, TLS $TLS_TIME, first byte $TTFB, total $TOTAL_TIME."
+  case $HTTP_CODE in
+    2*) WEB_STATE=passed; pass "HTTP $HTTP_CODE: the requested endpoint responded successfully." ;;
+    3*) WEB_STATE=passed; pass "HTTP $HTTP_CODE: the endpoint responded with a redirect. The destination was not tested." ;;
+    401|403) WEB_STATE=failed; WEB_ERROR="HTTP $HTTP_CODE: the endpoint is reachable, but access was denied."; fail "$WEB_ERROR" ;;
+    404) WEB_STATE=failed; WEB_ERROR='HTTP 404: the server responded, but the requested endpoint was not found.'; fail "$WEB_ERROR" ;;
+    5*) WEB_STATE=failed; WEB_ERROR="HTTP $HTTP_CODE: the server responded with a server error."; fail "$WEB_ERROR" ;;
+    *) WEB_STATE=failed; WEB_ERROR="HTTP $HTTP_CODE: the endpoint did not return a successful response."; fail "$WEB_ERROR" ;;
+  esac
+}
+
+summarize() {
+  RESULT=failed; RESULT_CODE=1
+  if [[ $DNS_STATE != passed ]]; then
+    SUMMARY=$DNS_ERROR
+  elif [[ -n $PORT && $TCP_STATE != passed ]]; then
+    SUMMARY="DNS succeeded, but no TCP connection succeeded on port $PORT."
+  elif (( WEB_EXPECTED )) && [[ $WEB_STATE == failed ]]; then
+    SUMMARY="TCP connected, but $WEB_ERROR"
+  elif (( WEB_EXPECTED )) && [[ $WEB_STATE != passed ]]; then
+    RESULT=inconclusive; RESULT_CODE=3; SUMMARY="TCP connected, but the web check was inconclusive. $WEB_ERROR"
+  elif [[ -n $PORT ]]; then
+    RESULT=passed; RESULT_CODE=0
+    if (( WEB_EXPECTED )); then
+      SUMMARY="TCP connected and the requested $SCHEME endpoint returned HTTP $HTTP_CODE."
+    else
+      SUMMARY="TCP connected to $TARGET_IP on port $PORT. Authentication and application behavior were not tested."
+    fi
+  elif [[ $PING_STATE == passed ]]; then
+    RESULT=passed; RESULT_CODE=0; SUMMARY='The address answered ping. No service port was tested.'
+  else
+    RESULT=inconclusive; RESULT_CODE=3; SUMMARY='The address resolved, but service reachability is inconclusive. Specify a port to test a service.'
+  fi
+  step 'Summary'
+  case $RESULT in passed) pass "$SUMMARY" ;; failed) fail "$SUMMARY" ;; *) warn "$SUMMARY" ;; esac
+}
+
+share_command() {
+  step 'Share test commands'
+  local family=$ADDRESS_FAMILY numeric_family ping_command=ping
+  local -a parts mac_parts linux_parts
+  # Share the original target so recipients resolve it on their own network.
+  numeric_family=$(ip_family "$HOST" 2>/dev/null)
+  if [[ -n $numeric_family ]]; then
+    family=$numeric_family
+  else
+    parts+=("nslookup ${(q)HOST}")
+  fi
+  [[ $family == auto ]] && family=""
+  [[ $family == 6 ]] && ping_command=ping6
+  local addr=$HOST
+  mac_parts=("${parts[@]}")
+  linux_parts=("${parts[@]}")
+  if (( ! QUICK )); then
+    mac_parts+=("$ping_command -c 3 ${(q)addr}")
+    linux_parts+=("ping ${family:+-$family }-c 3 ${(q)addr}")
+  fi
+  parts=()
+  if [[ -n $PORT ]]; then
+    parts+=("nc ${family:+-$family }-vz -w $TIMEOUT ${(q)addr} $PORT")
+  fi
+  if (( WEB_EXPECTED )); then
+    parts+=("curl -q -sS --globoff --noproxy '*'${family:+ -$family} --connect-timeout $TIMEOUT --max-time $TIMEOUT -o /dev/null -w 'HTTP %{http_code}\\n' --url ${(q)WEB_URL}")
+  fi
+  mac_parts+=("${parts[@]}")
+  linux_parts+=("${parts[@]}")
+  info "Share a similar command for the recipient's operating system."
+  if [[ "${(j:; :)mac_parts}" == "${(j:; :)linux_parts}" ]]; then
+    step '  macOS / Linux (Terminal / Bash):'
+    [[ -n $PORT ]] && info 'Note: On Linux, this command assumes nc is the OpenBSD version.'
+    (( JSON_MODE )) || print -r -- "    ${(j:; :)mac_parts}"
+  else
+    step '  macOS (Terminal):'
+    (( JSON_MODE )) || print -r -- "    ${(j:; :)mac_parts}"
+    step '  Linux (Bash):'
+    [[ -n $PORT ]] && info 'Note: On Linux, this command assumes nc is the OpenBSD version.'
+    (( JSON_MODE )) || print -r -- "    ${(j:; :)linux_parts}"
+  fi
+  step '  Windows (PowerShell):'
+  if [[ -n $PORT ]]; then
+    info 'Note: Checks TCP and ping only. TLS and HTTP are not tested.'
+  else
+    info 'Note: Checks ping only. No service port is tested.'
+  fi
+  (( JSON_MODE )) || print -r -- "    Test-NetConnection -ComputerName '$addr'${PORT:+ -Port $PORT}"
+}
+
+emit_json() {
+  # JSON::PP is bundled with Perl. It escapes all strings, including tool errors.
+  perl -MJSON::PP -e '
+    my @names = qw(timestamp run host port scheme url address_family timeout quick result exit_code summary dns_state dns_error target_ip route_state interface gateway local_ip tunnel_route ping_state packet_loss average_ms tcp_state tcp_error web_state web_error http_status remote_ip tls_state dns_seconds connect_seconds tls_seconds first_byte_seconds total_seconds);
+    my %v; @v{@names} = splice @ARGV, 0, scalar @names;
+    my (@ips, @attempts);
+    while (@ARGV && $ARGV[0] ne "--attempts") { push @ips, shift @ARGV }
+    shift @ARGV;
+    for (@ARGV) { my ($ip, $state, $detail) = split /\|/, $_, 3; push @attempts, {ip => $ip, state => $state, detail => $detail} }
+    my $number = sub { defined $_[0] && $_[0] =~ /^\d+(?:\.\d+)?$/ ? 0 + $_[0] : undef };
+    my $optional = sub { length($_[0]) ? $_[0] : undef };
+    my $out = {
+      schema_version => 1, timestamp => $v{timestamp}, run => 0+$v{run},
+      target => {host => $v{host}, port => $number->($v{port}), scheme => $optional->($v{scheme}), url => $optional->($v{url}), address_family => $v{address_family}},
+      options => {timeout_seconds => 0+$v{timeout}, quick => $v{quick} ? JSON::PP::true : JSON::PP::false},
+      result => $v{result}, exit_code => 0+$v{exit_code}, summary => $v{summary},
+      dns => {state => $v{dns_state}, addresses => \@ips, error => $optional->($v{dns_error})},
+      route => {state => $v{route_state}, target_ip => $optional->($v{target_ip}), interface => $optional->($v{interface}), gateway => $optional->($v{gateway}), interface_address => $optional->($v{local_ip}), tunnel_interface => $v{tunnel_route} ? JSON::PP::true : JSON::PP::false},
+      ping => {state => $v{ping_state}, packet_loss_percent => $number->($v{packet_loss}), average_ms => $number->($v{average_ms})},
+      tcp => {state => $v{tcp_state}, attempts => \@attempts, error => $optional->($v{tcp_error})},
+      web => {state => $v{web_state}, error => $optional->($v{web_error}), http_status => ($v{http_status} =~ /^[1-5]\d\d$/ ? 0+$v{http_status} : undef), remote_ip => $optional->($v{remote_ip}), tls => $v{tls_state}, timings_seconds => {dns => $number->($v{dns_seconds}), connect => $number->($v{connect_seconds}), tls => $number->($v{tls_seconds}), first_byte => $number->($v{first_byte_seconds}), total => $number->($v{total_seconds})}}
+    };
+    print JSON::PP->new->canonical->encode($out), "\n";
+  ' "$TIMESTAMP" "$RUN_NUMBER" "$HOST" "$PORT" "$SCHEME" "$WEB_URL" "$ADDRESS_FAMILY" "$TIMEOUT" "$QUICK" "$RESULT" "$RESULT_CODE" "$SUMMARY" "$DNS_STATE" "$DNS_ERROR" "$TARGET_IP" "$ROUTE_STATE" "$ROUTE_INTERFACE" "$ROUTE_GATEWAY" "$LOCAL_IP" "$TUNNEL_ROUTE" "$PING_STATE" "$PING_LOSS" "$PING_AVG" "$TCP_STATE" "$TCP_ERROR" "$WEB_STATE" "$WEB_ERROR" "$HTTP_CODE" "$REMOTE_IP" "$TLS_STATE" "$DNS_TIME" "$CONNECT_TIME" "$TLS_TIME" "$TTFB" "$TOTAL_TIME" "${DNS_IPS[@]}" --attempts "${TCP_ATTEMPTS[@]}"
+}
+
+run_test() {
+  reset_result
+  if (( ! JSON_MODE )); then
+    print
+    print -r -- "${BOLD}Testing $HOST${PORT:+ on port $PORT}${RESET}  $TIMESTAMP  Run $RUN_NUMBER/$REPEAT"
+    info 'Checks use direct connections. Applications using a proxy may take a different route.'
+  fi
+  check_dns
+  if [[ $DNS_STATE == passed ]]; then
+    [[ -n $PORT ]] && check_port
+    check_route
+    (( QUICK )) || check_ping
+    (( WEB_EXPECTED )) && [[ $TCP_STATE == passed ]] && check_web
+  fi
+  summarize
+  if (( JSON_MODE )); then
+    emit_json || { error 'Could not serialize the result.'; return 2; }
+  else
+    share_command
+  fi
+  return "$RESULT_CODE"
+}
+
+run_repeated() {
+  local aggregate=0 rc
+  for (( RUN_NUMBER=1; RUN_NUMBER<=REPEAT; RUN_NUMBER++ )); do
+    run_test
+    rc=$?
+    (( rc == 2 )) && return 2
+    if (( rc == 1 )); then aggregate=1
+    elif (( rc == 3 && aggregate == 0 )); then aggregate=3
+    fi
+    (( RUN_NUMBER < REPEAT && INTERVAL > 0 )) && sleep "$INTERVAL"
+  done
+  return "$aggregate"
+}
+
+session() {
+  if (( ${#POSITIONAL} )); then
+    prepare_target "${POSITIONAL[1]}" "${POSITIONAL[2]}" || return 2
+    run_repeated
+    return $?
+  fi
+  (( JSON_MODE )) && { error '--json requires an address.'; return 2; }
+  [[ -t 0 ]] || { error 'Provide an address when standard input is not a terminal.'; return 2; }
+  print -r -- "${BOLD}Network Connection Tester${RESET}"
+  local addr port aggregate=0 rc
+  while true; do
+    print
+    read -r "addr?Address (or press Enter to quit): " || break
+    [[ -z ${addr//[[:space:]]/} ]] && break
+    prepare_target "$addr" '' || { aggregate=2; continue; }
+    port=""
+    if [[ -n $PORT ]]; then
+      read -r "port?Port [$PORT] (or Enter to keep): " || break
+    else
+      read -r "port?Port (or Enter to skip): " || break
+    fi
+    port=${port##[[:space:]]#}; port=${port%%[[:space:]]#}
+    prepare_target "$addr" "$port" || { aggregate=2; continue; }
+    run_repeated; rc=$?
+    if (( rc == 2 )); then aggregate=2
+    elif (( rc == 1 && aggregate != 2 )); then aggregate=1
+    elif (( rc == 3 && aggregate == 0 )); then aggregate=3
+    fi
+  done
+  print 'Bye!'
+  return "$aggregate"
+}
+
+main() {
+  TIMEOUT=8; REPEAT=1; INTERVAL=1; QUICK=0; JSON_MODE=0; ADDRESS_FAMILY=auto; OUTPUT_FILE=""
+  typeset -ga POSITIONAL=()
+  local arg option value dependency
+  while (( $# )); do
+    arg=$1; shift
+    case $arg in
+      -h|--help) help_text; return 0 ;;
+      --quick) QUICK=1 ;;
+      --json) JSON_MODE=1 ;;
+      --ipv4|--ipv6)
+        value=${arg#--ipv}
+        [[ $ADDRESS_FAMILY == auto || $ADDRESS_FAMILY == $value ]] || { error 'Choose either --ipv4 or --ipv6.'; return 2; }
+        ADDRESS_FAMILY=$value ;;
+      --timeout|--repeat|--interval|--output)
+        (( $# )) || { error "$arg requires a value."; return 2; }
+        value=$1; shift
+        case $arg in
+          --timeout) parse_number "$value" 1 3600 || { error '--timeout must be an integer from 1 to 3600.'; return 2; }; TIMEOUT=$NUMBER ;;
+          --repeat) parse_number "$value" 1 1000 || { error '--repeat must be an integer from 1 to 1000.'; return 2; }; REPEAT=$NUMBER ;;
+          --interval) parse_number "$value" 0 3600 || { error '--interval must be an integer from 0 to 3600.'; return 2; }; INTERVAL=$NUMBER ;;
+          --output) [[ -n $value ]] || { error '--output requires a filename.'; return 2; }; OUTPUT_FILE=${value:A} ;;
+        esac ;;
+      --) POSITIONAL+=("$@"); break ;;
+      -*) error "Unknown option: $arg"; return 2 ;;
+      *) POSITIONAL+=("$arg") ;;
+    esac
+  done
+  (( ${#POSITIONAL} <= 2 )) || { error 'Expected an address and optional port.'; return 2; }
+  for dependency in perl dscacheutil nc curl ping ping6 route ipconfig ifconfig awk date sleep; do
+    command -v "$dependency" >/dev/null || { error "Required macOS tool is missing: $dependency"; return 2; }
+  done
+  perl -MJSON::PP -MSocket=inet_pton,AF_INET,AF_INET6 -e 1 2>/dev/null || { error 'Perl JSON::PP and Socket modules are required.'; return 2; }
+  configure_output
+  if [[ -n $OUTPUT_FILE ]]; then
+    # Validate the target before opening a report file.
+    if (( ${#POSITIONAL} )); then
+      prepare_target "${POSITIONAL[1]}" "${POSITIONAL[2]}" || return 2
+    elif (( JSON_MODE )) || [[ ! -t 0 ]]; then
+      error 'An address is required for this output mode.'; return 2
+    fi
+    command -v tee >/dev/null || { error 'tee is required for --output.'; return 2; }
+    : > "$OUTPUT_FILE" || { error "Could not write report: $OUTPUT_FILE"; return 2; }
+    session | tee "$OUTPUT_FILE"
+    local -a pipeline_codes=("${pipestatus[@]}")
+    (( pipeline_codes[2] == 0 )) || { error "Could not write report: $OUTPUT_FILE"; return 2; }
+    return "${pipeline_codes[1]}"
+  fi
+  session
+}
+
+if [[ $ZSH_EVAL_CONTEXT == toplevel ]]; then
+  main "$@"
+  exit $?
+fi
